@@ -325,17 +325,31 @@ def create(body, traceparent):
     rc = span(trace, "incident.diagnose", root["spanId"], {"incident.root_cause": plan["rootCause"],
                                                          "incident.evidence_count": len(plan["evidenceIds"])})
     spans.append(rc)
-    dispatches = []
+    dispatches, logs = [], []
+
+    def ids(prefix):
+        h = secrets.token_hex(6)
+        return {"actionId": f"act_{prefix}{h}", "callId": f"call_{prefix}{h}", "attemptId": f"att_{prefix}{h}_1"}
     for k, d in enumerate(plan["diagnostics"]):
+        i = ids("d")
         s = span(trace, f"tool.dispatch {d['tool']}", rc["spanId"], {"tool.name": d["tool"], "tool.kind": "read_only",
-                                                                      "dispatch.index": k}, "SPAN_KIND_CLIENT")
+                 "action.id": i["actionId"], "call.id": i["callId"], "attempt.id": i["attemptId"], "attempt.number": 1},
+                 "SPAN_KIND_CLIENT")
         spans.append(s)
-        dispatches.append({"dispatchId": "dsp_" + s["spanId"], "tool": d["tool"], "arguments": d["arguments"],
+        dispatches.append({"dispatchId": i["callId"], **i, "attempt": 1, "tool": d["tool"], "arguments": d["arguments"],
                            "kind": "diagnostic", "spanId": s["spanId"], "status": "dispatched"})
+        logs.append({"timeUnixNano": ns(), "severityText": "INFO", "body": "tool.dispatch", "traceId": trace,
+                     "spanId": s["spanId"], "attributes": {"tool.name": d["tool"], **i}})
     eff = plan["effect"]
+    ei = ids("e")
+    if eff["requiresApproval"]:
+        ei["approvalId"] = "apr_" + secrets.token_hex(6)
     es = span(trace, f"tool.propose {eff['tool']}", root["spanId"], {"tool.name": eff["tool"], "tool.kind": "effect",
-                                                                    "approval.required": str(eff["requiresApproval"]).lower()})
+              "approval.required": str(eff["requiresApproval"]).lower(), "action.id": ei["actionId"],
+              "call.id": ei["callId"], "attempt.id": ei["attemptId"], **({"approval.id": ei["approvalId"]} if "approvalId" in ei else {})})
     spans.append(es)
+    logs.append({"timeUnixNano": ns(), "severityText": "INFO", "body": "effect.proposed", "traceId": trace,
+                 "spanId": es["spanId"], "attributes": {"tool.name": eff["tool"], **ei}})
     join = span(trace, "incident.join", root["spanId"], {"join.children": len(spans) - 1})
     spans.append(join)
     st = {
@@ -345,12 +359,12 @@ def create(body, traceparent):
         "state": "awaiting_diagnostic_results",
         "rootCause": plan["rootCause"], "evidenceIds": plan["evidenceIds"],
         "diagnostics": dispatches, "toolDispatches": dispatches,
-        "proposedEffect": {"effectId": "eff_" + es["spanId"], "tool": eff["tool"], "arguments": eff.get("arguments", {}),
+        "proposedEffect": {"effectId": ei["actionId"], **ei, "attempt": 1, "tool": eff["tool"], "arguments": eff.get("arguments", {}),
                            "requiresApproval": eff["requiresApproval"],
                            "status": "awaiting_approval" if eff["requiresApproval"] else "pending_diagnostics",
                            "spanId": es["spanId"]},
         "actionResults": [],
-        "telemetry": {"traceId": trace, "rootSpanId": root["spanId"], "spans": spans},
+        "telemetry": {"traceId": trace, "rootSpanId": root["spanId"], "spans": spans, "logs": logs},
         "traceparent": f"00-{trace}-{root['spanId']}-01",
         "reason": plan.get("reason", "")[:300],
     }
@@ -437,6 +451,8 @@ async def post_incident(request: Request):
                 return JSONResponse(public_view(json.loads(row[1])), headers={"x-replay": "true"})
             c.execute("INSERT INTO incidents VALUES(?,?,?)", (key, fp, json.dumps(st)))
             c.execute("INSERT OR REPLACE INTO incidents VALUES(?,?,?)", ("id|" + st["incidentId"], fp, json.dumps({"ref": key})))
+            if st.get("runId"):
+                c.execute("INSERT OR REPLACE INTO incidents VALUES(?,?,?)", ("id|" + st["runId"], fp, json.dumps({"ref": key})))
     return JSONResponse(public_view(st), headers={"traceparent": st["traceparent"]})
 
 
@@ -477,5 +493,5 @@ async def post_continue(iid: str, tail: str, request: Request):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def catch_all(path: str):
     if path == "":
-        return JSONResponse({"ok": True, "agent": "incident", "version": 2})
+        return JSONResponse({"ok": True, "agent": "incident", "version": 3})
     return err(404, f"no route /{path}")
