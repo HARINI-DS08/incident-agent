@@ -361,8 +361,11 @@ def precise_plan(inc, policy, entries, llm):
 
 # ================================================================== state machine
 def waiting(st, dispatches, approvals):
+    eff_sent = any(l["phase"] == "effect" for l in st["logical"])
     return {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"], "dispatches": dispatches,
-            "approvals": approvals}
+            "approvals": approvals, "chosenEffect": st["chosenEffect"] if eff_sent or approvals or st["approvalRecords"] else None,
+            "suppressed": st["suppressed"], "actionLog": list(st["actionLog"]), "receiptLog": list(st["receiptLog"]),
+            "otlp": build_otlp(st)}
 
 
 def new_dispatch(st, lg, attempt, extra=None):
@@ -681,5 +684,5 @@ def get_incident(run_id: str):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def catch_all(path: str):
     if path == "":
-        return JSONResponse({"ok": True, "agent": "incident", "version": 5})
+        return JSONResponse({"ok": True, "agent": "incident", "version": 6})
     return err(404, "not found")
