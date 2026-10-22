@@ -24,6 +24,8 @@ LOCK = threading.RLock()
 
 READ_ONLY_DEFAULT = ["query_logs", "query_metrics", "inspect_deployment", "read_runbook"]
 EFFECT_FOR = {
+    "traffic_capacity_exhaustion": "scale_service",
+    "secret_rotation_mismatch": "page_owner",
     "deployment_regression": "rollback_deployment",
     "feature_flag_recursion": "disable_feature",
     "database_connection_exhaustion": "scale_service",
@@ -172,7 +174,8 @@ the cause) with EXACT arguments derived from the case (service id, metric names,
 runbook topic exactly as written in the evidence/catalog). Then choose the permitted response (effect tool) and its
 exact arguments: rollback for a deployment regression, disable a feature flag for flag recursion, scale for capacity
 exhaustion ONLY if the service is below its permitted scaling limit - if already at the permitted limit, page the owner
-instead; certificate problems -> page owner unless a dedicated tool exists. Never include secrets in arguments.
+instead; certificate problems -> page owner unless a dedicated tool exists. Every tool call must contain EXACTLY the
+required argument names listed in the catalog for that tool, with values copied from the case. Never include secrets.
 Return JSON only: {"rootCause": "...", "evidenceIds": [...], "diagnostics": [{"tool": "...", "arguments": {...}}],
 "effect": {"tool": "...", "arguments": {...}}, "atScalingLimit": true|false|null, "reason": "one sentence"}"""
 
@@ -181,13 +184,13 @@ def llm_plan(inc, catalog, policy, entries):
     if not LLM_KEY:
         return None
     useful = [(e, t) for e, t in entries if not NOISE.search(t)] or entries
-    listing = "\n".join(f"{e}: {t}" for e, t in useful)[:24000]
+    listing = "\n".join(f"{e}: {t[:700]}" for e, t in useful)[:9000]
     user = (f"service: {inc.get('service')}\nseverity: {inc.get('severity')}\ntitle: {inc.get('title')}\n"
             f"allowedRootCauses: {json.dumps(inc.get('allowedRootCauses'))}\n"
-            f"toolCatalog: {json.dumps(catalog)[:6000]}\npolicy: {json.dumps(policy)}\n\nEVIDENCE:\n{listing}")
+            f"toolCatalog (name: required args): {json.dumps({t.get('name'): (t.get('inputSchema') or {}).get('required') for t in catalog if isinstance(t, dict)})}\npolicy: {json.dumps(policy)}\n\nEVIDENCE:\n{listing}")
     try:
-        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=35, json={
-            "model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=httpx.Timeout(8.0, connect=3.0), json={
+            "model": LLM_MODEL, "temperature": 0, "max_tokens": 450, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM.replace("MAX_DIAG", str(policy.get("maximumDiagnostics", 3)))},
                          {"role": "user", "content": user}]})
         return json.loads(r.json()["choices"][0]["message"]["content"])
@@ -197,6 +200,8 @@ def llm_plan(inc, catalog, policy, entries):
 
 
 KEYWORDS = {
+    "traffic_capacity_exhaustion": r"traffic|capacity|cpu|saturat|replica|load spike|requests per second|throttl",
+    "secret_rotation_mismatch": r"secret|rotation|rotated|credential|signing key|auth(entication)? fail|401|403",
     "deployment_regression": r"deploy|release|rollout|version|build",
     "database_connection_exhaustion": r"connection pool|connections|db pool|database|max_connections|pool exhaust",
     "dependency_certificate_expired": r"certificate|tls|x509|ssl|expired cert",
@@ -214,9 +219,25 @@ def rule_plan(inc, catalog, policy, entries):
         if len(hits) > score:
             best, score, ev = rc, len(hits), hits
     svc = inc.get("service")
-    diags = [{"tool": "query_metrics", "arguments": {"service": svc, "metric": "error_rate", "windowMinutes": 30}}]
+    txt = " ".join(t for e, t in useful if e in ev)
+    win = re.search(r"(\d+)[- ]minute", txt)
+    win = int(win.group(1)) if win else 30
+    diags = {
+        "deployment_regression": [{"tool": "inspect_deployment", "arguments": {"service": svc}}],
+        "dependency_certificate_expired": [{"tool": "dependency_status", "arguments": {"dependency": (re.search(r"dependency\s+([\w.-]+)", txt) or [None, svc])[1]}}],
+    }.get(best, [{"tool": "query_metrics", "arguments": {"service": svc, "metric": (re.search(r"metric\s+([\w.]+)", txt) or [None, "error_rate"])[1], "windowMinutes": win}}])
+    tool = EFFECT_FOR.get(best, "page_owner")
+    args = {"service": svc}
+    if tool == "rollback_deployment":
+        args["release"] = (re.search(r"release\s+([\w.-]+)", txt) or [None, ""])[1]
+    elif tool == "disable_feature":
+        args["flag"] = (re.search(r"flag\s+([\w.-]+)", txt) or [None, ""])[1]
+    elif tool == "scale_service":
+        args["targetReplicas"] = int((re.search(r"(\d+)\s+replicas", txt) or [None, "2"])[1])
+    else:
+        args["severity"] = inc.get("severity", "SEV-1")
     return {"rootCause": best, "evidenceIds": ev[:3], "diagnostics": diags,
-            "effect": {"tool": EFFECT_FOR.get(best, "page_owner"), "arguments": {"service": svc}},
+            "effect": {"tool": tool, "arguments": args},
             "atScalingLimit": any(re.search(r"permitted (scaling )?(maximum|limit)|scaling limit|already at (the )?(max|limit)",
                                             t, re.I) for _, t in useful),
             "reason": "rule-based"}
@@ -243,7 +264,10 @@ def sanitize_plan(p, inc, catalog, policy, entries):
     if eff.get("tool") not in (effect_tools or set(EFFECT_FOR.values()) | {"page_owner"}):
         eff = {"tool": EFFECT_FOR.get(p["rootCause"], "page_owner"), "arguments": {"service": inc.get("service")}}
     if eff.get("tool") == "scale_service" and p.get("atScalingLimit"):
-        eff = {"tool": "page_owner", "arguments": {"service": inc.get("service")}}
+        eff = {"tool": "page_owner", "arguments": {"service": inc.get("service"), "severity": inc.get("severity", "SEV-1")}}
+    if eff.get("tool") in ("page_owner", "open_incident"):
+        eff.setdefault("arguments", {}).setdefault("severity", inc.get("severity", "SEV-1"))
+        eff["arguments"].setdefault("service", inc.get("service"))
     if any(s in json.dumps(eff) for s in sens):
         eff["arguments"] = {"service": inc.get("service")}
     eff["requiresApproval"] = eff["tool"] in (policy.get("approvalRequiredFor") or [])
@@ -259,6 +283,14 @@ def fingerprint(body):
 def validate(body):
     if not isinstance(body, dict):
         return "body must be a JSON object"
+    if body.get("profile") != "ga5-incident-agent/v2":
+        return "unsupported profile"
+    if not isinstance(body.get("runId"), str) or not body["runId"]:
+        return "runId is required"
+    if "toolCatalog" in body and not isinstance(body["toolCatalog"], list):
+        return "toolCatalog must be a list"
+    if "policy" in body and not isinstance(body["policy"], dict):
+        return "policy must be an object"
     inc = body.get("incident")
     if not isinstance(inc, dict):
         return "incident object is required"
@@ -445,5 +477,5 @@ async def post_continue(iid: str, tail: str, request: Request):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def catch_all(path: str):
     if path == "":
-        return JSONResponse({"ok": True, "agent": "incident", "version": 1})
+        return JSONResponse({"ok": True, "agent": "incident", "version": 2})
     return err(404, f"no route /{path}")
