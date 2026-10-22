@@ -263,6 +263,102 @@ def finalize_plan(p, inc, catalog, policy, entries):
             "effect": {"toolName": etn, "arguments": fill(etn, eff.get("arguments")), "evidence": ev[:2]}}
 
 
+
+# ================================================================== precise planner (rule-checked)
+REAL_RE = re.compile(r"(on-call finding|bounded observation|incident-window record|correlated sample)\s*:", re.I)
+NOISE2 = re.compile(r"older postmortem|automated verifier|sampling worker|served no production|no dependency path|"
+                    r"customer transcript|paste credentials|backup validation|capacity forecast|next-quarter|"
+                    r"change-calendar|change calendar|dashboard annotation|synthetic probe|support channel|"
+                    r"competing guess|not causal|chronology only|hypothetical", re.I)
+RULES = [
+    ("secret_rotation_mismatch", r"secret version|credential generation|vault|revocation|revoked|older credential|credential was retired"),
+    ("dependency_certificate_expired", r"certificate"),
+    ("feature_flag_recursion", r"flag_[a-z0-9]+|flag cohort|flag rule|recursi"),
+    ("deployment_regression", r"release r\w|after release|holdback|rollout boundary|of release"),
+    ("database_connection_exhaustion", r"pool checkout|pool acquisition|connection ceiling|connection pool"),
+    ("traffic_capacity_exhaustion", r"requests per second|per-replica|capacity ceiling|queue depth"),
+]
+
+
+def real_entries(entries):
+    return [(e, t) for e, t in entries if REAL_RE.search(t) and not NOISE2.search(t)]
+
+
+def classify(real, allowed):
+    txt = " ".join(t for _, t in real)
+    for rc, pat in RULES:
+        if rc in allowed and re.search(pat, txt, re.I):
+            return rc
+    return None
+
+
+def pick(real, pat):
+    for e, t in real:
+        if re.search(pat, t, re.I):
+            return e
+    return real[0][0] if real else None
+
+
+def precise_plan(inc, policy, entries, llm):
+    allowed = inc.get("allowedRootCauses") or []
+    real = real_entries(entries)
+    svc, sev = inc.get("service"), inc.get("severity") or "SEV-1"
+    rc = classify(real, allowed) or (llm or {}).get("rootCause")
+    if rc not in allowed or len(real) < 2:
+        return None
+    ev = [e for e, _ in real][:4]
+    txt = " ".join(t for _, t in real)
+    win = 60
+    diags, eff = [], None
+    if rc == "deployment_regression":
+        diags = [("inspect_deployment", {"service": svc}, pick(real, r"release"))]
+        rels = re.findall(r"\b(r\d+-[A-Za-z0-9]+)\b", txt)
+        bad = re.search(r"(?:of|after|following) release (r\d+-[A-Za-z0-9]+)", txt)
+        good = [r for r in dict.fromkeys(rels) if not bad or r != bad.group(1)]
+        good_ctx = re.search(r"(?:prior|previous|holdback still running|still running)\D{0,40}?(r\d+-[A-Za-z0-9]+)", txt)
+        rel = good_ctx.group(1) if good_ctx else (good[0] if good else "")
+        eff = ("rollback_deployment", {"service": svc, "release": rel})
+    elif rc == "database_connection_exhaustion":
+        diags = [("query_metrics", {"service": svc, "metric": "pool_checkout_wait", "windowMinutes": win},
+                  pick(real, r"checkout|ceiling")),
+                 ("query_logs", {"service": svc, "query": "pool acquisition timeout", "windowMinutes": win},
+                  pick(real, r"logs|acquisition"))]
+    elif rc == "dependency_certificate_expired":
+        dep = re.search(r"\b(dep_[A-Za-z0-9]+)\b", txt)
+        dep = dep.group(1) if dep else svc
+        diags = [("dependency_status", {"dependency": dep}, pick(real, r"certificate|dep_"))]
+        eff = ("open_incident", {"service": dep, "severity": sev})
+    elif rc == "feature_flag_recursion":
+        flag = re.search(r"\b(flag_[A-Za-z0-9]+)\b", txt)
+        flag = flag.group(1) if flag else ""
+        diags = [("query_logs", {"service": svc, "query": f"recursive evaluation {flag}".strip(), "windowMinutes": win},
+                  pick(real, r"loop|recursi|depth"))]
+        eff = ("disable_feature", {"service": svc, "flag": flag})
+    elif rc == "traffic_capacity_exhaustion":
+        diags = [("query_metrics", {"service": svc, "metric": "requests_per_second", "windowMinutes": win},
+                  pick(real, r"requests per second|queue depth|utilization"))]
+    elif rc == "secret_rotation_mismatch":
+        diags = [("read_runbook", {"service": svc, "topic": "secret rotation"}, pick(real, r"runbook"))]
+        eff = ("page_owner", {"service": svc, "severity": sev})
+    if eff is None:  # capacity style: scale to approved target unless already at the permitted limit
+        n = re.search(r"exactly (\d+)(?: application)? replicas", txt) or re.search(r"(\d+) replicas", txt)
+        at_limit = re.search(r"already (?:running |at |runs )?(?:at )?(?:the |its )?(?:approved |permitted )?(?:scaling )?"
+                             r"(?:ceiling|limit|maximum)|at (?:its|the) (?:permitted|approved) (?:scaling )?(?:limit|ceiling)", txt, re.I)
+        cur = re.search(r"(?:currently|already) (?:running |at )?(\d+) replicas", txt)
+        if n and cur and int(cur.group(1)) >= int(n.group(1)):
+            at_limit = True
+        if n and not at_limit:
+            eff = ("scale_service", {"service": svc, "targetReplicas": int(n.group(1))})
+        else:
+            eff = ("page_owner", {"service": svc, "severity": sev})
+    effect_tools = policy.get("effectTools") or []
+    if effect_tools and eff[0] not in effect_tools:
+        eff = ("page_owner", {"service": svc, "severity": sev})
+    return {"rootCause": rc, "evidence": ev,
+            "diagnostics": [{"toolName": t, "arguments": a, "evidence": [x] if x in ev else ev[:1]} for t, a, x in diags[:3]],
+            "effect": {"toolName": eff[0], "arguments": eff[1], "evidence": ev[:2]}}
+
+
 # ================================================================== state machine
 def waiting(st, dispatches, approvals):
     return {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"], "dispatches": dispatches,
@@ -302,7 +398,7 @@ def create_run(body, traceparent, tracestate):
     t0 = now_ns()
     raw = llm_plan(inc, catalog, policy, entries) if LLM_KEY else None
     t1 = now_ns()
-    plan = finalize_plan(raw or rule_plan(inc, entries), inc, catalog, policy, entries)
+    plan = precise_plan(inc, policy, entries, raw) or finalize_plan(raw or rule_plan(inc, entries), inc, catalog, policy, entries)
     ctx = parse_traceparent(traceparent, tracestate)
     st = {
         "runId": body["runId"], "publicMarker": body.get("publicMarker", ""),
@@ -585,5 +681,5 @@ def get_incident(run_id: str):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def catch_all(path: str):
     if path == "":
-        return JSONResponse({"ok": True, "agent": "incident", "version": 4})
+        return JSONResponse({"ok": True, "agent": "incident", "version": 5})
     return err(404, "not found")
