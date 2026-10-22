@@ -562,7 +562,7 @@ async def post_receipt(run_id: str, request: Request):
                 return JSONResponse(json.loads(prev[1])) if prev[0] == fp else err(409, "receiptId already used with different content")
             st = json.loads(r[0])
             if st["status"] != "waiting":
-                return err(409, "run is already terminal")
+                return err(422, "run is already terminal")
             resp, e = apply_receipt(st, body)
             if e:
                 return err(422, e)
