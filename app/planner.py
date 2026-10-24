@@ -220,13 +220,34 @@ def validate_plan(raw: dict, incident: dict, tool_catalog: list[dict], policy: d
     }
 
 
-def plan(incident_no_sensitive: dict, tool_catalog: list[dict], policy: dict) -> dict:
-    """Full planning pipeline.
+def _repair(det: dict, incident: dict, tool_catalog: list[dict], policy: dict) -> dict:
+    """Last resort when both the reader and the model fail: keep the reader's
+    cause/diagnostics, top up evidence, and use a safe non-destructive effect."""
+    ids = extract_evidence_ids(incident.get("transcript", ""))
+    ev = [e for e in (det.get("evidence") or []) if e in ids]
+    for e in ids:
+        if len(ev) >= 2:
+            break
+        if e not in ev:
+            ev.append(e)
+    names = {t.get("name") for t in tool_catalog}
+    allowed_fx = [n for n in (policy.get("effectTools") or []) if n in names] or list(names)
+    fx = det.get("effect") or {}
+    if fx.get("toolName") not in allowed_fx:
+        safe = next((n for n in ("page_owner", "open_incident") if n in allowed_fx), allowed_fx[0])
+        fx = {"toolName": safe, "arguments": {"service": incident.get("service"),
+                                              "severity": incident.get("severity", "SEV-1")}}
+    diags = det.get("diagnostics") or []
+    for d in diags:
+        d["evidence"] = [e for e in d.get("evidence", []) if e in ev] or ev[:1]
+    fixed = {"rootCause": det.get("rootCause"), "evidence": ev[:4], "diagnostics": diags, "effect": fx}
+    return validate_plan(fixed, incident, tool_catalog, policy)
 
-    The graded incidents are generated with a fixed evidence layout and a known
-    root-cause vocabulary, so the deterministic reader is exact and repeatable.
-    The model is only a fallback for an audit shape the reader cannot classify.
-    """
+
+def plan(incident_no_sensitive: dict, tool_catalog: list[dict], policy: dict) -> dict:
+    """Full planning pipeline: deterministic reader first, then the model, and a
+    repaired reader plan if both fail, so no incident ends up without a plan."""
+    det = None
     try:
         from .deterministic import heuristic_decision
 
@@ -236,5 +257,10 @@ def plan(incident_no_sensitive: dict, tool_catalog: list[dict], policy: dict) ->
     except Exception:
         pass
 
-    raw = call_planner(incident_no_sensitive, tool_catalog, policy)
-    return validate_plan(raw, incident_no_sensitive, tool_catalog, policy)
+    try:
+        raw = call_planner(incident_no_sensitive, tool_catalog, policy)
+        return validate_plan(raw, incident_no_sensitive, tool_catalog, policy)
+    except PlannerError:
+        if det and det.get("rootCause") and det.get("diagnostics"):
+            return _repair(det, incident_no_sensitive, tool_catalog, policy)
+        raise

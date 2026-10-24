@@ -99,7 +99,8 @@ _RELEASE_RE = re.compile(r"\b(r\d+-[A-Za-z0-9]+|d-\d+|v\d+\.\d+\.\d+)\b")
 _GOOD_CTX = ("previous", "prior", "last known good", "known-good", "known good",
              "healthy", "stable", "no matching errors", "no errors",
              "remains healthy", "was healthy", "baseline", "holdback",
-             "rolled back to", "roll back to", "revert to", "last good")
+             "rolled back to", "roll back to", "revert to", "last good",
+             "still on", "still running")
 _BAD_CTX = ("malformed", "regression", "regressed", "errors", "error", "failing",
             "failed", "broke", "broken", "spiked", "degraded", "faulty",
             "introduced", "started returning", "within ninety seconds",
@@ -269,6 +270,18 @@ _REF_PLAN: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
+
+def _replica_state(text: str):
+    """(current, maximum) from 'replicas=X ... maximum=Y' style lines, else (None, None)."""
+    cur = re.search(r"\breplicas\s*[=:]\s*(\d+)", text, re.I)
+    mx = re.search(r"\b(?:maximum|max|ceiling|limit)\s*[=:]\s*(\d+)", text, re.I)
+    return (int(cur.group(1)) if cur else None, int(mx.group(1)) if mx else None)
+
+
+def _rollback_blocked(text: str) -> bool:
+    """A deploy freeze or no free rollback slot means page the owner instead."""
+    return bool(re.search(r"\bfreeze\s*[=:]\s*1\b|\bslots\s*[=:]\s*0\b", text, re.I))
 
 
 def _at_scaling_limit(text: str) -> bool:
@@ -489,11 +502,30 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
             if safe in catalog_names and (not effect_tools or safe in effect_tools):
                 chosen_effect_name = safe
                 break
+    def _page_tool():
+        for safe in ("page_owner", "open_incident"):
+            if safe in catalog_names and (not effect_tools or safe in effect_tools):
+                return safe
+        return chosen_effect_name
+
+    cur_rep, max_rep = _replica_state(signal_raw)
+    target_override = None
+    if chosen_effect_name == "scale_service" and cur_rep is not None and max_rep is not None:
+        if cur_rep >= max_rep:
+            chosen_effect_name = _page_tool()      # already at the permitted limit
+        else:
+            target_override = cur_rep + 1          # one step up, within the limit
+    if chosen_effect_name == "rollback_deployment" and _rollback_blocked(signal_raw):
+        chosen_effect_name = _page_tool()
+
     chosen_effect = next((t for t in catalog if t.get("name") == chosen_effect_name), None)
     if chosen_effect:
+        eff_args = build_args(chosen_effect)
+        if target_override is not None and "targetReplicas" in eff_args:
+            eff_args["targetReplicas"] = target_override
         effect = {
             "toolName": chosen_effect.get("name"),
-            "arguments": build_args(chosen_effect),
+            "arguments": eff_args,
             "evidence": list(evidence),
             "needs_approval": chosen_effect.get("name") in approval_tools,
         }
