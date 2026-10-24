@@ -186,3 +186,55 @@ async def get_incident(run_id: str) -> JSONResponse:
     if state is None:
         raise HTTPException(404, "unknown runId")
     return _json(build_get(state))
+
+
+# ------------------------------------------------------------ debug view
+# Read-only summary of the grader's runs from the local trace file. The
+# sensitive object is never written to that file, so nothing secret is shown.
+from fastapi.responses import PlainTextResponse  # noqa: E402
+import re as _re  # noqa: E402
+from collections import Counter as _Counter  # noqa: E402
+
+
+@app.get("/debug/runs/{nonce}", response_class=PlainTextResponse)
+async def debug_runs(nonce: str, last: int = 12) -> PlainTextResponse:
+    try:
+        with open(_TRACE_PATH, encoding="utf-8") as fh:
+            rows = [json.loads(l) for l in fh if l.strip()]
+    except OSError:
+        return PlainTextResponse("no trace yet")
+    order, runs = [], {}
+    for r in rows:
+        rid = r.get("runId")
+        if rid not in runs:
+            runs[rid] = []
+            order.append(rid)
+        runs[rid].append(r)
+    out = []
+    for rid in order[-last:]:
+        out.append(f"\n===== {rid}")
+        for r in runs[rid]:
+            k = r["kind"]
+            if k == "create_request":
+                inc = (r.get("request") or {}).get("incident") or {}
+                out.append(f"service={inc.get('service')} title={inc.get('title')}")
+                for line in (inc.get("transcript") or "").splitlines():
+                    if line.startswith("[ev_") and "corr_" not in line.lower():
+                        out.append("  SIGNAL " + line[:400])
+            elif k in ("create_response", "receipt_response"):
+                resp = r.get("response") or {}
+                ds = [(d.get("phase"), d.get("toolName"), d.get("arguments"), d.get("attempt"),
+                       d.get("approvalId")) for d in resp.get("dispatches") or []]
+                out.append(f"  <- {k} status={resp.get('status')} diag={resp.get('diagnosis')} "
+                           f"dispatches={ds} approvals={[a.get('toolName') for a in resp.get('approvals') or []]} "
+                           f"chosen={resp.get('chosenEffect')} suppressed={resp.get('suppressed')}")
+                if resp.get("otlp"):
+                    spans = resp["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                    out.append(f"     spans={dict(_Counter(s['name'] for s in spans))}")
+            elif k == "receipt_request":
+                req = r.get("request") or {}
+                oc = [(o.get("attempt"), o.get("status"), o.get("errorType"), o.get("resultClass"))
+                      for o in req.get("outcomes") or []]
+                ap = [a.get("decision") for a in req.get("approvals") or []]
+                out.append(f"  -> receipt {req.get('receiptId')} outcomes={oc} approvals={ap}")
+    return PlainTextResponse("\n".join(out))
